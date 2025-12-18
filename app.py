@@ -2,6 +2,7 @@ import os
 import sqlite3
 import hashlib
 import random
+import difflib
 from datetime import date, datetime, time, timedelta
 
 import pandas as pd
@@ -326,6 +327,40 @@ def init_db():
         )
         """
     )
+
+
+    # ---------- 교재(마스터/학생이력) ----------
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS textbook_master (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            publisher TEXT,
+            level TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS student_textbooks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            textbook_name TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            memo TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_student_textbooks_student_id ON student_textbooks(student_id)")
+    except Exception:
+        pass
 
     conn.commit()
 
@@ -1564,6 +1599,7 @@ def render_sidebar():
                         "내 학교 성적",
                         "내 시간표",
                         "내 단어장",
+                        "내 교재",
                         "내 시험지 자료",
                     ],
                     key="student_menu",
@@ -1581,6 +1617,7 @@ def render_sidebar():
                     "성적 관리",         # 5
                     "시간표 관리",       # 6
                     "반(클래스) 관리",   # 7 (클래스관리)
+                    "교재 관리",         # 8
                 ]
                 if is_master:
                     admin_items.append("관리자 승인")  # 8
@@ -1614,538 +1651,227 @@ def render_sidebar():
 # ============== 관리자 화면 ==============
 
 def admin_student_management():
+    st.markdown("### 👩‍🎓 학생 관리")
 
+    # --- Helper: 월별 출결 맵 생성 ---
+    def _build_month_att_map(student_id: int, year: int, month: int):
         import calendar
-    from datetime import date
+        last_day = calendar.monthrange(year, month)[1]
+        daily = {d: "" for d in range(1, last_day + 1)}
 
-    base_date = st.date_input(
-        "조회할 월 (임의 날짜 선택)",
-        value=date.today(),
-        key="admin_att_cal_base",
-    )
+        conn = get_connection()
+        cur = conn.cursor()
+        # 한 달치만 한번에 조회
+        start = date(year, month, 1).strftime("%Y-%m-%d")
+        end = date(year, month, last_day).strftime("%Y-%m-%d")
+        cur.execute(
+            """
+            SELECT date, status
+            FROM attendance
+            WHERE student_id=? AND date BETWEEN ? AND ?
+            """,
+            (student_id, start, end),
+        )
+        rows = cur.fetchall()
+        conn.close()
 
-    year = base_date.year
-    month = base_date.month
+        # 날짜별 여러 기록이 있을 수 있어 "가장 나쁜 상태" 우선
+        by_day = {}
+        for d_str, status in rows:
+            try:
+                day_num = int(d_str.split("-")[-1])
+            except Exception:
+                continue
+            by_day.setdefault(day_num, []).append(status)
 
-    # ✅ 들여쓰기 레벨: 여기부터 전부 동일
-    first_day = date(year, month, 1)
-    last_day_num = calendar.monthrange(year, month)[1]
-    first_wday = first_day.weekday()  # 월=0
-
-    st.markdown("### 👦 학생 관리")
-
-    students = get_students()
-
-    # 학생 조회 시 선택된 학생을 세션에 보관
-    if "selected_student_id" not in st.session_state:
-        st.session_state["selected_student_id"] = students[0][0] if students else None
-
-    # 탭 순서: 학생 조회 -> 학생 목록 -> 등록 -> 자료 업로드
-    tab_view, tab_list, tab_add, tab_docs = st.tabs(
-        ["학생 조회", "학생 목록", "학생 등록", "자료 업로드"]
-    )
-
-    # ------------------------------------------------------------------
-    # 탭 1. 학생 조회
-    # ------------------------------------------------------------------
-    with tab_view:
-        if not students:
-            st.info("등록된 학생이 없습니다.")
-        else:
-            # 현재 선택된 학생
-            id_to_student = {
-                sid: (sid, name, school, grade, phone, memo)
-                for sid, name, school, grade, phone, memo in students
-            }
-            # 학생 선택 드롭다운
-            options = {
-                f"{name} ({grade}, {school}) [ID:{sid}]": sid
-                for sid, name, school, grade, phone, memo in students
-            }
-
-            # 기본값: 세션에 저장된 학생
-            default_sid = st.session_state.get("selected_student_id")
-            if default_sid not in id_to_student and students:
-                default_sid = students[0][0]
-
-            if default_sid in id_to_student:
-                default_label = [
-                    k for k, v in options.items() if v == default_sid
-                ][0]
-                idx = list(options.keys()).index(default_label)
+        for d, statuses in by_day.items():
+            if "미인정결석" in statuses or "결석" in statuses:
+                daily[d] = "결석"
+            elif "지각" in statuses:
+                daily[d] = "지각"
+            elif "조퇴" in statuses:
+                daily[d] = "조퇴"
             else:
-                idx = 0
+                daily[d] = "출석"
+        return daily
 
-            sel_label = st.selectbox(
-                "조회할 학생을 선택하세요",
-                list(options.keys()),
-                index=idx,
-                key="student_view_select",
-            )
-            student_id = options[sel_label]
-            st.session_state["selected_student_id"] = student_id
+    # --- Helper: 캘린더 렌더 ---
+    def _render_calendar(year: int, month: int, daily: dict):
+        import calendar
+        cal = calendar.Calendar(firstweekday=0)  # 월=0
+        weeks = cal.monthdayscalendar(year, month)
 
-            sid, name, school, grade, phone, memo = id_to_student[student_id]
+        header = ["월", "화", "수", "목", "금", "토", "일"]
+        table = []
+        table.append(header)
 
-            st.markdown("#### 기본 정보")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write(f"**이름:** {name}")
-                st.write(f"**학교:** {school}")
-                st.write(f"**학년:** {grade}")
-            with c2:
-                st.write(f"**학부모 연락처:** {phone}")
-                st.write(f"**비고:** {memo}")
-
-            st.markdown("---")
-
-            # 7-1. 학생 시간표 (주간 캘린더 형식)
-            st.markdown("#### 🗓 학생 시간표 (주간)")
-
-            classes_for_stu = get_classes_for_student(sid)
-            if not classes_for_stu:
-                st.info("배정된 반이 없습니다.")
-            else:
-                class_ids = [cid for cid, cname, clevel in classes_for_stu]
-                rows = get_timetables_for_classes(class_ids)
-
-                if not rows:
-                    st.info("등록된 시간표가 없습니다.")
+        for w in weeks:
+            row = []
+            for d in w:
+                if d == 0:
+                    row.append("")
+                    continue
+                mark = daily.get(d, "")
+                if mark == "결석":
+                    cell = f"**{d}** ❌"
+                elif mark == "지각":
+                    cell = f"**{d}** ⏰"
+                elif mark == "조퇴":
+                    cell = f"**{d}** 🏃"
+                elif mark == "출석":
+                    cell = f"**{d}** ✅"
                 else:
-                    # weekday: 0~6 → 월~일
-                    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
-                    timetable_map = {i: [] for i in range(7)}
-                    for (
-                        tid,
-                        class_name,
-                        weekday,
-                        start_time,
-                        end_time,
-                        subject,
-                        room,
-                        teacher,
-                        memo_tt,
-                        class_id_row,
-                    ) in rows:
-                        text = f"{start_time}-{end_time}\n{class_name}\n{subject} / {teacher}"
-                        timetable_map[weekday].append((start_time, text))
+                    cell = f"{d}"
+                row.append(cell)
+            table.append(row)
 
-                    # 요일별 시간순 정렬
-                    for w in timetable_map:
-                        timetable_map[w].sort(key=lambda x: x[0])
+        # markdown table
+        st.markdown(
+            "\n".join(
+                [
+                    "|" + "|".join(r) + "|"
+                    for r in table[:1]
+                ]
+                + ["|" + "|".join(["---"] * 7) + "|"]
+                + ["|" + "|".join(r) + "|" for r in table[1:]]
+            )
+        )
 
-                    # 가장 긴 요일의 수만큼 행 생성
-                    max_len = max(len(v) for v in timetable_map.values())
-                    cal_data = []
-                    for row_idx in range(max_len):
-                        row = {}
-                        for w in range(7):
-                            if row_idx < len(timetable_map[w]):
-                                row[weekday_names[w]] = timetable_map[w][row_idx][1]
-                            else:
-                                row[weekday_names[w]] = ""
-                        cal_data.append(row)
+    # --- 학생 목록 ---
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, name, school, grade, class_id, phone, parent_phone, created_at
+        FROM students
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
 
-                    df_tt = pd.DataFrame(cal_data, columns=weekday_names)
-                    st.dataframe(df_tt, use_container_width=True)
+    if not rows:
+        st.info("등록된 학생이 없습니다.")
+        return
 
-            st.markdown("---")
+    df = pd.DataFrame(
+        rows,
+        columns=["ID", "이름", "학교", "학년", "반ID", "연락처", "보호자연락처", "등록일"],
+    )
 
-            # 7-2. 출결 / 일일 test / 과제 / 진도 / 출결(캘린더) / 부모님 번호 / 학년
-            st.markdown("#### 🕒 출결 · 과제 · 일일 테스트 기록")
+    left, right = st.columns([2, 1])
+    with left:
+        st.markdown("#### 학생 목록")
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # 최근 출결 100개
-            conn = get_connection()
-            cur = conn.cursor()
+    with right:
+        st.markdown("#### 학생 선택")
+        opts = [f'{r[1]} (ID:{r[0]})' for r in rows]
+        sel = st.selectbox("조회할 학생", opts, key="admin_student_sel")
+        sid = int(sel.split("ID:")[-1].rstrip(")"))
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📌 기본정보", "🗓️ 시간표", "✅ 출결", "📚 진도"])
+
+    # ---------- 기본정보 ----------
+    with tab1:
+        one = df[df["ID"] == sid].iloc[0].to_dict()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("이름", one.get("이름", ""))
+        c2.metric("학교", one.get("학교", ""))
+        c3.metric("학년", one.get("학년", ""))
+
+        st.write(
+            {
+                "반ID": one.get("반ID", ""),
+                "연락처": one.get("연락처", ""),
+                "보호자연락처": one.get("보호자연락처", ""),
+                "등록일": one.get("등록일", ""),
+            }
+        )
+
+    # ---------- 시간표 ----------
+    with tab2:
+        st.markdown("#### 🗓️ 개인 시간표")
+        # 학생이 속한 반들의 시간표를 그대로 보여줌
+        class_rows = get_classes_for_student(sid)
+        if not class_rows:
+            st.info("배정된 반이 없습니다.")
+        else:
+            class_ids = [r[0] for r in class_rows]
+            t_rows = get_timetables_for_classes(class_ids)
+            if not t_rows:
+                st.info("등록된 시간표가 없습니다.")
+            else:
+                df_t = pd.DataFrame(
+                    t_rows,
+                    columns=["반ID", "반명", "요일", "시작", "종료", "과목", "강사", "메모"],
+                )
+                st.dataframe(df_t, use_container_width=True, hide_index=True)
+
+    # ---------- 출결 ----------
+    with tab3:
+        st.markdown("#### ✅ 최근 출결 (최근 30일)")
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT date, status, memo
+            FROM attendance
+            WHERE student_id=?
+            ORDER BY date DESC
+            LIMIT 30
+            """,
+            (sid,),
+        )
+        att_rows = cur.fetchall()
+        conn.close()
+
+        if att_rows:
+            df_att = pd.DataFrame(att_rows, columns=["날짜", "상태", "메모"])
+            st.dataframe(df_att, use_container_width=True, hide_index=True)
+        else:
+            st.info("출결 기록이 없습니다.")
+
+        st.markdown("---")
+        st.markdown("#### 📆 출결 캘린더 (월별)")
+        base_date = st.date_input(
+            "조회할 월 (임의 날짜 선택)",
+            value=date.today(),
+            key="admin_att_cal_base",
+        )
+        year, month = base_date.year, base_date.month
+        daily = _build_month_att_map(sid, year, month)
+        _render_calendar(year, month, daily)
+
+    # ---------- 진도 ----------
+    with tab4:
+        st.markdown("#### 📚 진도 기록")
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            # 현재 스키마(academy_progress): date, student_id, class_id, subject, unit, memo, recorded_by
             cur.execute(
                 """
-                SELECT date, checkin_time, status,
-                       homework_status, daily_test_status
-                FROM attendance
+                SELECT date, subject, unit, memo, recorded_by
+                FROM academy_progress
                 WHERE student_id=?
-                ORDER BY date DESC, checkin_time DESC
-                LIMIT 100
+                ORDER BY date DESC
+                LIMIT 200
                 """,
                 (sid,),
             )
-            att_rows = cur.fetchall()
+            prog_rows = cur.fetchall()
+        except Exception as e:
+            prog_rows = []
+            st.warning(f"진도 테이블 조회 오류: {e}")
+        finally:
             conn.close()
 
-            if not att_rows:
-                st.info("출결 기록이 없습니다.")
-            else:
-                att_data = []
-                for dt_str, t_str, status, hw, test in att_rows:
-                    att_data.append(
-                        {
-                            "날짜": dt_str,
-                            "시간": t_str,
-                            "출결": status,
-                            "과제": hw or "",
-                            "일일테스트": test or "",
-                        }
-                    )
-                df_att = pd.DataFrame(att_data)
-
-                def color_cell(val):
-                    if val == "정상출석":
-                        return "background-color:#2f855a; color:white"
-                    if val == "지각":
-                        return "background-color:#d69e2e; color:white"
-                    if val == "미인정결석":
-                        return "background-color:#c53030; color:white"
-                    if val == "○":
-                        return "background-color:#2f855a; color:white"
-                    if val == "△":
-                        return "background-color:#d69e2e; color:white"
-                    if val == "X":
-                        return "background-color:#c53030; color:white"
-                    return ""
-
-                styled = df_att.style.applymap(
-                    color_cell, subset=["출결", "과제", "일일테스트"]
-                )
-                st.dataframe(styled, use_container_width=True)
-
-            st.markdown("---")
-
-            # 진도 (학원 진도 테이블에서 불러오기 - 스키마에 맞춰 조정 가능)
-            st.markdown("#### 📚 진도 기록")
-
-            conn = get_connection()
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    """
-                    SELECT date, subject, content, teacher, memo
-                    FROM academy_progress
-                    WHERE student_id=?
-                    ORDER BY date DESC
-                    """,
-                    (sid,),
-                )
-                prog_rows = cur.fetchall()
-            except Exception:
-                prog_rows = []
-            conn.close()
-
-            if not prog_rows:
-                st.info("진도 기록이 없습니다.")
-            else:
-                prog_data = []
-                for dt_str, subj, content, teacher, memo_p in prog_rows:
-                    prog_data.append(
-                        {
-                            "날짜": dt_str,
-                            "과목": subj,
-                            "내용": content,
-                            "선생님": teacher,
-                            "메모": memo_p or "",
-                        }
-                    )
-                st.dataframe(
-                    pd.DataFrame(prog_data),
-                    use_container_width=True,
-                )
-
-            st.markdown("---")
-
-            # 출결 캘린더 (월 단위)
-            st.markdown("#### 📆 출결 캘린더 (월별)")
-
-            base_date = st.date_input(
-                "조회할 월 (임의 날짜 선택)",
-                value=date.today(),
-                key="stu_att_cal_base",
-            )
-            year = base_date.year
-            month = base_date.month
-
-            import calendar
-
-            first_day = date(year, month, 1)
-            last_day_num = calendar.monthrange(year, month)[1]
-
-            # 날짜별 출결 요약 (학생 한 명 기준이므로 출결 종류 카운트)
-            daily_status = {}
-            conn = get_connection()
-            cur = conn.cursor()
-            for d in range(1, last_day_num + 1):
-                dt_obj = date(year, month, d)
-                d_str = dt_obj.strftime("%Y-%m-%d")
-                cur.execute(
-                    """
-                    SELECT status
-                    FROM attendance
-                    WHERE student_id=? AND date=?
-                    """,
-                    (sid, d_str),
-                )
-                rows = cur.fetchall()
-                if not rows:
-                    daily_status[d] = ""
-                else:
-                    # 가장 나쁜 상태 우선으로 표기 (결석 > 지각 > 정상)
-                    statuses = [r[0] for r in rows]
-                    if "미인정결석" in statuses:
-                        daily_status[d] = "결석"
-                    elif "지각" in statuses:
-                        daily_status[d] = "지각"
-                    else:
-                        daily_status[d] = "출석"
-            conn.close()
-
-    # 6x7 캘린더 매트릭스 생성
-    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
-    cal_matrix = [["" for _ in range(7)] for _ in range(6)]
-
-    import calendar
-from datetime import date
-
-# base_date가 있든 없든, year/month를 먼저 확정
-base_date = st.date_input(
-    "조회할 월 (임의 날짜 선택)",
-    value=date.today(),
-    key="admin_att_cal_base",
-)
-year = base_date.year
-month = base_date.month
-
-# ✅ 여기서 무조건 first_day 정의
-first_day = date(year, month, 1)
-last_day_num = calendar.monthrange(year, month)[1]
-
-# ✅ 이제 사용
-first_wday = first_day.weekday()  # 월=0
-
-    first_wday = first_day.weekday()  # 월=0
-    week_idx = 0
-    col_idx = first_wday
-
-    for day in range(1, last_day_num + 1):
-        status = daily_status.get(day, "")
-        if status:
-            cell = f"{day}\n{status}"
+        if prog_rows:
+            df_prog = pd.DataFrame(prog_rows, columns=["날짜", "과목", "단원/내용", "메모", "기록자"])
+            st.dataframe(df_prog, use_container_width=True, hide_index=True)
         else:
-            cell = f"{day}"
-        cal_matrix[week_idx][col_idx] = cell
-        col_idx += 1
-        if col_idx >= 7:
-            col_idx = 0
-            week_idx += 1
-
-    df_cal = pd.DataFrame(cal_matrix, columns=weekdays)
-    st.dataframe(df_cal, use_container_width=True)
-    st.caption("셀에 날짜와 출결 상태(출석/지각/결석)가 표시됩니다.")
-
-    # ------------------------------------------------------------------
-    # 탭 2. 학생 목록  (검색 + 클릭 → 조회용 학생 세션에 반영)
-    # ------------------------------------------------------------------
-    with tab_list:
-        if not students:
-            st.info("등록된 학생이 없습니다.")
-        else:
-            # 현재 로그인 사용자 (마스터만 삭제 권한)
-            user = st.session_state.get("user")
-            is_master = user and user.get("role") == "master"
-
-            # 이름 검색
-            search = st.text_input(
-                "이름 검색",
-                key="student_list_search",
-            ).strip()
-
-            if search:
-                filtered = [
-                    (sid, name, school, grade, phone, memo)
-                    for sid, name, school, grade, phone, memo in students
-                    if search in name
-                ]
-            else:
-                filtered = students
-
-            if not filtered:
-                st.info("검색 결과가 없습니다.")
-            else:
-                st.markdown("#### 학생 목록")
-                st.caption(
-                    "이름을 클릭하면 상단 '학생 조회' 탭에서 해당 학생의 상세 정보를 바로 볼 수 있습니다."
-                )
-                st.markdown("---")
-
-                for sid, name, school, grade, phone, memo in filtered:
-                    # 마스터일 때만 삭제 버튼용 컬럼 추가
-                    if is_master:
-                        c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
-                    else:
-                        c1, c2, c3 = st.columns([2, 3, 2])
-                        c4 = None
-
-                    with c1:
-                        # 이름을 버튼처럼 사용 -> 조회용 학생 세션 변경
-                        if st.button(
-                            name,
-                            key=f"student_name_btn_{sid}",
-                        ):
-                            st.session_state["selected_student_id"] = sid
-                            st.success(
-                                f"'{name}' 학생이 조회 대상으로 설정되었습니다. "
-                                "상단의 '학생 조회' 탭에서 확인하세요."
-                            )
-                            st.rerun()
-
-                    with c2:
-                        st.write(f"{school} / {grade}")
-
-                    with c3:
-                        st.write(f"부모님 연락처: {phone}")
-
-                    # 삭제 버튼 (마스터 전용)
-                    if is_master and c4 is not None:
-                        with c4:
-                            if st.button(
-                                "삭제",
-                                key=f"student_delete_btn_{sid}",
-                            ):
-                                delete_student(sid)
-                                st.warning(f"'{name}' 학생이 삭제되었습니다.")
-                                st.rerun()
-
-    # ------------------------------------------------------------------
-    # 탭 3. 학생 등록  (기존 등록 기능)
-    # ------------------------------------------------------------------
-    with tab_add:
-        with st.form("add_student_form"):
-            name = st.text_input("이름 *")
-            school = st.text_input("학교")
-            grade = st.text_input("학년 (예: 중2, 고1)")
-            phone = st.text_input("부모님 연락처")
-            memo = st.text_area("비고(선택)")
-            submitted = st.form_submit_button("학생 등록")
-            if submitted:
-                if not name.strip():
-                    st.warning("이름은 필수입니다.")
-                else:
-                    add_student(
-                        name.strip(),
-                        school.strip(),
-                        grade.strip(),
-                        phone.strip(),
-                        memo.strip(),
-                    )
-                    st.success(f"'{name}' 학생이 등록되었습니다.")
-                    st.rerun()
-
-    # ------------------------------------------------------------------
-    # 탭 4. 자료 업로드 (기존 시험지 / 자료 업로드)
-    # ------------------------------------------------------------------
-    with tab_docs:
-        user = st.session_state["user"]
-        students = get_students()
-        if not students:
-            st.info("먼저 학생을 등록해주세요.")
-        else:
-            opts = {
-                f"{name} ({grade}, {school})": sid
-                for sid, name, school, grade, phone, memo in students
-            }
-            label = st.selectbox(
-                "학생 선택",
-                list(opts.keys()),
-                key="examdoc_student",
-            )
-            student_id = opts[label]
-
-            subject = st.text_input("과목", key="examdoc_subject")
-            exam_type = st.selectbox(
-                "시험 종류",
-                ["학교 중간", "학교 기말", "모의고사", "학원 테스트", "프린트", "기타"],
-                key="examdoc_type",
-            )
-            exam_name = st.text_input("시험/자료 이름", key="examdoc_name")
-            d = st.date_input(
-                "시험/자료 날짜",
-                value=date.today(),
-                key="examdoc_date",
-            )
-            tags = st.text_input(
-                "태그 (쉼표로 구분, 예: 중2,내신)",
-                key="examdoc_tags",
-            )
-            memo = st.text_area("메모", key="examdoc_memo")
-
-            uploaded = st.file_uploader(
-                "시험지 / 자료 파일 업로드 (이미지 또는 PDF)",
-                type=["pdf", "png", "jpg", "jpeg"],
-                accept_multiple_files=False,
-            )
-
-            if st.button("자료 저장", key="examdoc_save"):
-                if not uploaded:
-                    st.warning("파일을 업로드해주세요.")
-                else:
-                    file_path, original_name = save_uploaded_file(
-                        uploaded, student_id
-                    )
-                    add_exam_document(
-                        student_id,
-                        subject.strip(),
-                        exam_type.strip(),
-                        exam_name.strip(),
-                        d.strftime("%Y-%m-%d"),
-                        tags.strip(),
-                        memo.strip(),
-                        file_path,
-                        original_name,
-                        user["id"],
-                    )
-                    st.success("시험지 / 자료가 저장되었습니다.")
-
-            st.markdown("#### 📄 해당 학생의 시험지 / 자료 목록")
-            docs = get_exam_documents_for_student(student_id)
-            if not docs:
-                st.info("등록된 자료가 없습니다.")
-            else:
-                for (
-                    doc_id,
-                    subj,
-                    etype,
-                    ename,
-                    edate,
-                    dtags,
-                    dmemo,
-                    fpath,
-                    oname,
-                    uploaded_at,
-                ) in docs:
-                    title = f"{edate} • {subj} • {ename}"
-                    with st.expander(title):
-                        st.write(f"유형: {etype}")
-                        st.write(f"태그: {dtags}")
-                        st.write(f"메모: {dmemo}")
-                        st.write(f"업로드 시간: {uploaded_at}")
-                        try:
-                            with open(fpath, "rb") as f:
-                                file_bytes = f.read()
-                            if fpath.lower().endswith(
-                                (".png", ".jpg", ".jpeg")
-                            ):
-                                st.image(
-                                    file_bytes,
-                                    caption=oname,
-                                    use_container_width=True,
-                                )
-                            else:
-                                st.download_button(
-                                    label="📎 파일 다운로드",
-                                    data=file_bytes,
-                                    file_name=oname,
-                                    mime="application/pdf",
-                                )
-                        except FileNotFoundError:
-                            st.error(f"파일을 찾을 수 없습니다. (경로: {fpath})")
-
-
+            st.info("진도 기록이 없습니다.")
 def admin_class_management():
     st.markdown("### 🏫 반(클래스) 관리")
 
@@ -5677,6 +5403,286 @@ def student_vocab_view():
         )
 
 
+
+
+# ============== 교재(마스터/학생이력) ==============
+
+def _suggest_textbooks(query: str, master_names: list[str], n: int = 5) -> list[str]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    # 1) 부분 포함 우선
+    partial = [name for name in master_names if q.lower() in name.lower()]
+    if partial:
+        return partial[:n]
+    # 2) 유사도 기반
+    try:
+        return difflib.get_close_matches(q, master_names, n=n, cutoff=0.55)
+    except Exception:
+        return []
+
+
+def get_master_textbooks() -> list[tuple]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, name, publisher, level, created_at
+        FROM textbook_master
+        ORDER BY name COLLATE NOCASE
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def add_master_textbook(name: str, publisher: str = "", level: str = "") -> None:
+    name = (name or "").strip()
+    if not name:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO textbook_master (name, publisher, level)
+        VALUES (?, ?, ?)
+        """,
+        (name, (publisher or "").strip(), (level or "").strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_master_textbook(tid: int, name: str, publisher: str = "", level: str = "") -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE textbook_master
+        SET name=?, publisher=?, level=?
+        WHERE id=?
+        """,
+        ((name or "").strip(), (publisher or "").strip(), (level or "").strip(), tid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_master_textbook(tid: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM textbook_master WHERE id=?", (tid,))
+    conn.commit()
+    conn.close()
+
+
+def get_student_textbooks(student_id: int) -> list[tuple]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, textbook_name, start_date, end_date, memo, created_at
+        FROM student_textbooks
+        WHERE student_id=?
+        ORDER BY created_at DESC
+        """,
+        (student_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def add_student_textbook(student_id: int, textbook_name: str, start_date: str = "", end_date: str = "", memo: str = "") -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO student_textbooks (student_id, textbook_name, start_date, end_date, memo)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (student_id, (textbook_name or "").strip(), (start_date or "").strip(), (end_date or "").strip(), (memo or "").strip()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_student_textbook(row_id: int, textbook_name: str, start_date: str = "", end_date: str = "", memo: str = "") -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE student_textbooks
+        SET textbook_name=?, start_date=?, end_date=?, memo=?
+        WHERE id=?
+        """,
+        ((textbook_name or "").strip(), (start_date or "").strip(), (end_date or "").strip(), (memo or "").strip(), row_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_student_textbook(row_id: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM student_textbooks WHERE id=?", (row_id,))
+    conn.commit()
+    conn.close()
+
+
+def admin_textbook_management():
+    st.markdown("### 📘 교재 관리 (마스터 / 학생 이력)")
+
+    tab1, tab2 = st.tabs(["📚 교재 마스터", "👩‍🎓 학생 교재 이력"])
+
+    with tab1:
+        st.markdown("#### 교재 마스터 등록/수정/삭제")
+        master_rows = get_master_textbooks()
+        dfm = pd.DataFrame(master_rows, columns=["ID", "교재명", "출판사", "레벨", "등록일"]) if master_rows else pd.DataFrame(columns=["ID", "교재명", "출판사", "레벨", "등록일"])
+        st.dataframe(dfm, use_container_width=True, hide_index=True)
+
+        with st.expander("➕ 교재 추가", expanded=True):
+            name = st.text_input("교재명", key="tbm_add_name")
+            publisher = st.text_input("출판사(선택)", key="tbm_add_pub")
+            level = st.text_input("레벨/비고(선택)", key="tbm_add_level")
+            if st.button("추가", key="tbm_add_btn", use_container_width=True):
+                add_master_textbook(name, publisher, level)
+                st.success("추가 완료")
+                st.rerun()
+
+        if master_rows:
+            st.markdown("---")
+            st.markdown("#### ✏️ 선택 교재 수정/삭제")
+            id_to_row = {f"{r[1]} (ID:{r[0]})": r for r in master_rows}
+            sel = st.selectbox("교재 선택", list(id_to_row.keys()), key="tbm_sel")
+            r = id_to_row[sel]
+            tid = r[0]
+
+            new_name = st.text_input("교재명", value=r[1], key="tbm_edit_name")
+            new_pub = st.text_input("출판사", value=r[2] or "", key="tbm_edit_pub")
+            new_level = st.text_input("레벨/비고", value=r[3] or "", key="tbm_edit_level")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("저장", key="tbm_save_btn", use_container_width=True):
+                    update_master_textbook(tid, new_name, new_pub, new_level)
+                    st.success("저장 완료")
+                    st.rerun()
+            with c2:
+                if st.button("삭제", key="tbm_del_btn", use_container_width=True):
+                    delete_master_textbook(tid)
+                    st.warning("삭제 완료")
+                    st.rerun()
+
+    with tab2:
+        st.markdown("#### 학생 교재 이력 (추가/수정/삭제)")
+        # 반 -> 학생 선택
+        classes = get_classes()
+        if not classes:
+            st.info("반이 없습니다.")
+            return
+
+        class_label_to_id = {f"{c[1]} (ID:{c[0]})": c[0] for c in classes}
+        sel_class = st.selectbox("반 선택", list(class_label_to_id.keys()), key="tb_hist_class_sel")
+        cid = class_label_to_id[sel_class]
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, name
+            FROM students
+            WHERE class_id=?
+            ORDER BY name
+            """,
+            (cid,),
+        )
+        students = cur.fetchall()
+        conn.close()
+        if not students:
+            st.info("해당 반에 학생이 없습니다.")
+            return
+
+        stu_label_to_id = {f"{s[1]} (ID:{s[0]})": s[0] for s in students}
+        sel_stu = st.selectbox("학생 선택", list(stu_label_to_id.keys()), key="tb_hist_student_sel")
+        sid = stu_label_to_id[sel_stu]
+
+        master_names = [r[1] for r in get_master_textbooks()]
+
+        st.markdown("---")
+        st.markdown("##### ➕ 이력 추가")
+        name_in = st.text_input("교재명(자유 입력)", key="tb_hist_add_name")
+        sugg = _suggest_textbooks(name_in, master_names, n=5)
+        if sugg:
+            st.caption("유사 교재 추천: " + ", ".join(sugg))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.text_input("시작일(YYYY-MM-DD, 선택)", key="tb_hist_add_start")
+            end = st.text_input("종료일(YYYY-MM-DD, 선택)", key="tb_hist_add_end")
+        memo = st.text_area("메모(선택)", key="tb_hist_add_memo")
+
+        if st.button("추가", key="tb_hist_add_btn", use_container_width=True):
+            if not name_in.strip():
+                st.error("교재명을 입력하세요.")
+            else:
+                add_student_textbook(sid, name_in, start, end, memo)
+                st.success("추가 완료")
+                st.rerun()
+
+        st.markdown("---")
+        hist = get_student_textbooks(sid)
+        if not hist:
+            st.info("교재 이력이 없습니다.")
+            return
+
+        dfh = pd.DataFrame(hist, columns=["ROW_ID", "교재명", "시작일", "종료일", "메모", "등록일"])
+        st.dataframe(dfh.drop(columns=["ROW_ID"]), use_container_width=True, hide_index=True)
+
+        st.markdown("##### ✏️ 이력 수정/삭제")
+        row_label_to_id = {f'{r[1]} / {r[2] or ""}~{r[3] or ""} (ROW:{r[0]})': r[0] for r in hist}
+        sel_row = st.selectbox("이력 선택", list(row_label_to_id.keys()), key="tb_hist_row_sel")
+        row_id = row_label_to_id[sel_row]
+        row = next(r for r in hist if r[0] == row_id)
+
+        edit_name = st.text_input("교재명", value=row[1], key="tb_hist_edit_name")
+        sugg2 = _suggest_textbooks(edit_name, master_names, n=5)
+        if sugg2:
+            st.caption("유사 교재 추천: " + ", ".join(sugg2))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            edit_start = st.text_input("시작일", value=row[2] or "", key="tb_hist_edit_start")
+            edit_end = st.text_input("종료일", value=row[3] or "", key="tb_hist_edit_end")
+        edit_memo = st.text_area("메모", value=row[4] or "", key="tb_hist_edit_memo")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("저장", key="tb_hist_save_btn", use_container_width=True):
+                update_student_textbook(row_id, edit_name, edit_start, edit_end, edit_memo)
+                st.success("저장 완료")
+                st.rerun()
+        with c2:
+            if st.button("삭제", key="tb_hist_del_btn", use_container_width=True):
+                delete_student_textbook(row_id)
+                st.warning("삭제 완료")
+                st.rerun()
+
+
+def student_textbook_view():
+    st.markdown("### 📘 내 교재")
+    user = st.session_state["user"]
+    student_id = user["student_id"]
+
+    hist = get_student_textbooks(student_id)
+    if not hist:
+        st.info("교재 이력이 없습니다.")
+        return
+
+    dfh = pd.DataFrame(hist, columns=["ROW_ID", "교재명", "시작일", "종료일", "메모", "등록일"])
+    st.dataframe(dfh.drop(columns=["ROW_ID"]), use_container_width=True, hide_index=True)
+
 def student_exam_documents_view():
     st.markdown("### 📄 내 시험지 / 자료")
     user = st.session_state["user"]
@@ -5788,6 +5794,8 @@ def main():
             student_timetable_view()
         elif menu == "내 단어장":
             student_vocab_view()
+        elif menu == "내 교재":
+            student_textbook_view()
         elif menu == "내 시험지 자료":
             student_exam_documents_view()
 
@@ -5813,6 +5821,8 @@ def main():
             admin_timetable()
         elif menu == "반(클래스) 관리":
             admin_class_management()
+        elif menu == "교재 관리":
+            admin_textbook_management()
         elif menu == "관리자 승인" and is_master:
             master_admin_approval()
 
