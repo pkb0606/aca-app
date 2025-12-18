@@ -1614,6 +1614,24 @@ def render_sidebar():
 # ============== 관리자 화면 ==============
 
 def admin_student_management():
+
+        import calendar
+    from datetime import date
+
+    base_date = st.date_input(
+        "조회할 월 (임의 날짜 선택)",
+        value=date.today(),
+        key="admin_att_cal_base",
+    )
+
+    year = base_date.year
+    month = base_date.month
+
+    # ✅ 들여쓰기 레벨: 여기부터 전부 동일
+    first_day = date(year, month, 1)
+    last_day_num = calendar.monthrange(year, month)[1]
+    first_wday = first_day.weekday()  # 월=0
+
     st.markdown("### 👦 학생 관리")
 
     students = get_students()
