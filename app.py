@@ -1881,6 +1881,25 @@ def admin_student_management():
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
     cal_matrix = [["" for _ in range(7)] for _ in range(6)]
 
+    import calendar
+from datetime import date
+
+# base_date가 있든 없든, year/month를 먼저 확정
+base_date = st.date_input(
+    "조회할 월 (임의 날짜 선택)",
+    value=date.today(),
+    key="admin_att_cal_base",
+)
+year = base_date.year
+month = base_date.month
+
+# ✅ 여기서 무조건 first_day 정의
+first_day = date(year, month, 1)
+last_day_num = calendar.monthrange(year, month)[1]
+
+# ✅ 이제 사용
+first_wday = first_day.weekday()  # 월=0
+
     first_wday = first_day.weekday()  # 월=0
     week_idx = 0
     col_idx = first_wday
